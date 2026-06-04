@@ -5,18 +5,16 @@ const os = require("os");
 const chokidar = require("chokidar");
 
 // --- 1. CONFIGURATION & PATHS ---
-// Dynamically use D:\ on Windows, and the Desktop on Mac for easy testing
 const basePath =
   os.platform() === "win32"
     ? "D:\\"
     : path.join(os.homedir(), "Desktop", "GapFlushTest");
 const SOURCE_DIR = path.join(basePath, "Source");
 const DESIRED_DIR = path.join(basePath, "Desired");
-const STATE_FILE = path.join(basePath, ".processed_db.json");
+let STATE_FILE;
 
 const MAP_RESULT = { 0: "NO", 1: "OF", "-1": "UF" };
 
-// Ensure directories exist
 [SOURCE_DIR, DESIRED_DIR].forEach((dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
@@ -37,95 +35,110 @@ function saveState() {
   fs.writeFileSync(STATE_FILE, JSON.stringify(stateDB, null, 2));
 }
 
-// --- 3. DATA CONVERSION ENGINE ---
-// --- 3. DATA CONVERSION ENGINE ---
+// --- 3. THE SMART CONVERSION ENGINE ---
 function convertFile(inputPath, outputPath) {
   try {
     const fileContent = fs.readFileSync(inputPath, "utf-8").trim();
-    if (!fileContent) return { ok: false, msg: "Empty file" };
+
+    // Situation 2: Fatal Errors
+    if (!fileContent)
+      return { ok: false, msg: "Error: File is completely empty." };
 
     const lines = fileContent
       .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-    if (lines.length === 0) return { ok: false, msg: "No valid rows" };
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    if (lines.length === 0)
+      return { ok: false, msg: "Error: No valid data rows found." };
 
-    // Process header from the first row
+    // Header & VIN Extraction (Formatting Date to dd-mm-yyyy)
+    // Header & VIN Extraction (Formatting Date to dd-mm-yyyy)
     const firstRow = lines[0].split(",");
+    const vin = firstRow[2] ? firstRow[2].trim() : "";
+
+    if (!vin)
+      return {
+        ok: false,
+        msg: "Error: Missing VIN / BSN in header. File rejected.",
+      };
+
+    // Regex swaps mm/dd/yyyy to dd-mm-yyyy
+    const formattedDate = firstRow[0]
+      ? firstRow[0].replace(/(\d{1,2})\/(\d{1,2})\/(\d{4})/, "$2-$1-$3")
+      : "";
+
     const header = [
-      firstRow[2],
+      vin,
       "Final",
-      firstRow[0],
+      formattedDate,
       firstRow[1] ? firstRow[1].replace(/ /g, ":") : "",
     ].join(",");
 
     let outputLines = [header];
-    let hasMissingFields = false; // <-- NEW: Flag to track missing data
+    let missingFields = [];
 
-    // Process each data row
+    // Data Row Parsing
     lines.forEach((line) => {
       let cols = line.split(",");
+      if (cols.length < 4) return;
 
-      // NEW: Check if the measured value (index 10) or status (index 11) is blank or missing
-      if (
-        cols.length < 12 ||
-        !cols[10] ||
-        cols[10].trim() === "" ||
-        !cols[11] ||
-        cols[11].trim() === ""
-      ) {
-        hasMissingFields = true;
+      const pointName = cols[3] ? cols[3].trim() : "Unknown Joint";
+
+      // Identify specific missing data points
+      if (cols.length < 11 || !cols[10] || cols[10].trim() === "") {
+        if (!missingFields.includes(`Measurement: ${pointName}`))
+          missingFields.push(`Measurement: ${pointName}`);
+      }
+      if (cols.length < 12 || !cols[11] || cols[11].trim() === "") {
+        if (!missingFields.includes(`Status Code: ${pointName}`))
+          missingFields.push(`Status Code: ${pointName}`);
       }
 
-      // Pad columns to prevent out-of-bounds errors
       while (cols.length < 12) cols.push("");
 
       const key = [cols[4], cols[5], cols[6]].filter(Boolean).join("_");
-
       const lsl = parseFloat(cols[7]);
       const usl = parseFloat(cols[9]);
       const measuredStr = cols[10].trim();
       const measured = parseFloat(measuredStr);
 
-      // Pass/Fail Logic
       let pf = "F";
       if (!isNaN(measured) && !isNaN(lsl) && !isNaN(usl)) {
         if (measured >= lsl && measured <= usl) pf = "P";
       }
 
-      // Reason Code Mapping
       const rfCode = cols[11].trim();
       const rf = MAP_RESULT[rfCode] || "NG";
 
-      // Construct Output Row
-      const outRow = [key, pf, rf, measuredStr, cols[7], cols[9]].join(",");
-      outputLines.push(outRow);
+      outputLines.push([key, pf, rf, measuredStr, cols[7], cols[9]].join(","));
     });
 
-    // Write to Desired folder
     fs.writeFileSync(outputPath, outputLines.join("\n"), "utf-8");
 
-    // NEW: Return a warning message if blanks were detected, otherwise standard Success
-    const finalMsg = hasMissingFields
-      ? "Processed (Missing source fields)"
-      : "Success";
-    return { ok: true, msg: finalMsg };
+    const finalMsg =
+      missingFields.length > 0
+        ? "Processed with missing data. Operator review required."
+        : "Processed perfectly.";
+    return { ok: true, msg: finalMsg, missing: missingFields };
   } catch (error) {
-    return { ok: false, msg: error.message };
+    return { ok: false, msg: `Error: ${error.message}` };
   }
 }
 
 // --- 4. THE WATCHER ---
-function processFile(filePath) {
+function processFile(filePath, force = false) {
+  const fileName = path.basename(filePath);
+
+  // Excel Ghost File Protection
+  if (fileName.startsWith("~$") || fileName.startsWith(".")) return;
+
   const ext = path.extname(filePath).toLowerCase();
   if (ext !== ".csv" && ext !== ".txt") return;
 
   const stats = fs.statSync(filePath);
   const mtime = stats.mtimeMs;
-  const fileName = path.basename(filePath);
 
-  // Only process if it's new or has been modified
-  if (!stateDB[fileName] || stateDB[fileName].mtime < mtime) {
+  if (force || !stateDB[fileName] || stateDB[fileName].mtime < mtime) {
     const baseName = path.parse(fileName).name;
     const outputPath = path.join(DESIRED_DIR, `${baseName}_converted.txt`);
 
@@ -133,8 +146,13 @@ function processFile(filePath) {
 
     stateDB[fileName] = {
       mtime: mtime,
-      status: result.ok ? "DONE" : "FAILED",
+      status: result.ok
+        ? result.missing && result.missing.length > 0
+          ? "WARNING"
+          : "DONE"
+        : "FAILED",
       msg: result.msg,
+      missing: result.missing || [],
       output: result.ok ? outputPath : null,
       processed_time: new Date().toLocaleString(),
     };
@@ -146,21 +164,24 @@ function startWatcher() {
   loadState();
   const watcher = chokidar.watch(SOURCE_DIR, {
     persistent: true,
+    ignored: /(^|[\/\\])\~\$.*/, // Ignore Excel lock files
     awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 100 },
   });
 
-  watcher.on("add", processFile).on("change", processFile);
+  watcher
+    .on("add", (p) => processFile(p, false))
+    .on("change", (p) => processFile(p, false));
 }
 
-// --- 5. ELECTRON APP & IPC BRIDGE ---
+// --- 5. ELECTRON APP ---
 let mainWindow;
-
 app.whenReady().then(() => {
+  STATE_FILE = path.join(app.getPath("userData"), "processed_db.json");
   startWatcher();
 
   mainWindow = new BrowserWindow({
-    width: 1100,
-    height: 750,
+    width: 1200,
+    height: 800,
     title: "GapFlush Live Dashboard",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -168,51 +189,38 @@ app.whenReady().then(() => {
       nodeIntegration: false,
     },
   });
-
   mainWindow.loadFile(path.join(__dirname, "src", "index.html"));
 });
 
-// IPC: Provide data to the frontend Dashboard
 ipcMain.handle("get-data", () => {
   try {
     const files = fs.readdirSync(SOURCE_DIR);
     let dashboardData = [];
-
     files.forEach((file) => {
       const ext = path.extname(file).toLowerCase();
-      if (ext !== ".csv" && ext !== ".txt") return;
-
-      const filePath = path.join(SOURCE_DIR, file);
-      const stats = fs.statSync(filePath);
+      if ((ext !== ".csv" && ext !== ".txt") || file.startsWith("~$")) return;
+      const stats = fs.statSync(path.join(SOURCE_DIR, file));
       const rec = stateDB[file] || {};
-
       dashboardData.push({
         name: file,
         status: rec.status || "NEW",
-        msg: rec.msg || "",
-        mtime: new Date(stats.mtimeMs).toLocaleTimeString(),
-        ptime: rec.processed_time || "",
+        msg: rec.msg || "Waiting in queue...",
+        missing: rec.missing || [],
+        mtime: new Date(stats.mtimeMs).toLocaleString(),
+        ptime: rec.processed_time || "Not processed yet",
         output: rec.output || "",
       });
     });
-
     return dashboardData;
   } catch (e) {
     return [];
   }
 });
 
-// IPC: Open the converted file locally
 ipcMain.handle("open-file", (event, filePath) => {
-  if (filePath && fs.existsSync(filePath)) {
-    shell.showItemInFolder(filePath);
-  }
+  if (filePath && fs.existsSync(filePath)) shell.showItemInFolder(filePath);
 });
-
-// IPC: Retrigger processing
 ipcMain.handle("retrigger-file", (event, fileName) => {
   const filePath = path.join(SOURCE_DIR, fileName);
-  if (fs.existsSync(filePath)) {
-    processFile(filePath);
-  }
+  if (fs.existsSync(filePath)) processFile(filePath, true);
 });

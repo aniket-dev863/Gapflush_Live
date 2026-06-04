@@ -1,13 +1,18 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
-// We are exposing a safe 'api' object to the frontend window
+/**
+ * CONTEXT BRIDGE
+ * This exposes a highly secure, restricted 'api' object to the frontend HTML/JS.
+ * It strictly controls exactly what the dashboard is allowed to ask the backend server to do,
+ * preventing any security vulnerabilities.
+ */
 contextBridge.exposeInMainWorld("api", {
-  // Ask the backend for the latest dashboard data
+  // Ask the background Node.js server for the latest file processing data
   getData: () => ipcRenderer.invoke("get-data"),
 
-  // Tell the backend to open the file folder
+  // Command the Windows OS to open the specific folder for a successful file
   openFile: (filePath) => ipcRenderer.invoke("open-file", filePath),
 
-  // Tell the backend to re-run a specific file
+  // Force the backend conversion engine to re-run a specific source file
   retrigger: (fileName) => ipcRenderer.invoke("retrigger-file", fileName),
 });
